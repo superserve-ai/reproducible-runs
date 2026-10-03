@@ -5,15 +5,32 @@ import hashlib
 import json
 import os
 import shlex
+import textwrap
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from superserve import Sandbox, __version__
 
-ROOT = "/tmp/lifecycle-task"
-EXPECTED = {"count": 5, "sum": 171}
+TASK_ROOT = "/tmp/lifecycle-task"
+EXPECTED_RESULT = {"count": 5, "sum": 171}
+
+START_WORKER = f"nohup python3 {TASK_ROOT}/worker.py >{TASK_ROOT}/worker.log 2>&1 </dev/null &"
+
+# Polls the worker's HTTP endpoint until it responds, instead of sleeping a fixed duration.
+WAIT_FOR_WORKER = textwrap.dedent("""\
+    import time, urllib.request
+    for _ in range(50):
+        try:
+            urllib.request.urlopen("http://127.0.0.1:8765/state", timeout=1)
+            break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        raise RuntimeError("worker did not start")
+    """)
 
 
 def require(condition, message):
@@ -21,79 +38,83 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("runs"))
-    args = parser.parse_args()
-    if not os.environ.get("SUPERSERVE_API_KEY"):
-        parser.error("Set SUPERSERVE_API_KEY before running this live example")
-    run_id = uuid.uuid4().hex[:12]
-    output = args.output / run_id
-    output.mkdir(parents=True)
-    sandboxes, snapshots = [], []
-    manifest = {
-        "schema_version": 1,
-        "run_id": run_id,
-        "sdk_version": __version__,
-        "status": "running",
-        "sandboxes": [],
-        "snapshots": [],
-        "scores": {},
-    }
+def worker_request(path, method):
+    """Python one-liner, run inside the sandbox, that calls the worker's HTTP API."""
+    return (
+        "import urllib.request; print(urllib.request.urlopen("
+        f"urllib.request.Request('http://127.0.0.1:8765/{path}', method={method!r}), "
+        "timeout=5).read().decode())"
+    )
 
-    def event(kind, **data):
-        with (output / "events.jsonl").open("a") as stream:
+
+@dataclass
+class Run:
+    """One invocation: creates sandboxes/snapshots, records events, writes evidence on exit."""
+
+    run_id: str
+    output: Path
+    manifest: dict
+    sandboxes: list = field(default_factory=list)
+    snapshots: list = field(default_factory=list)
+
+    @classmethod
+    def start(cls, output_root: Path) -> "Run":
+        run_id = uuid.uuid4().hex[:12]
+        output = output_root / run_id
+        output.mkdir(parents=True)
+        manifest = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "sdk_version": __version__,
+            "status": "running",
+            "sandboxes": [],
+            "snapshots": [],
+            "scores": {},
+        }
+        return cls(run_id=run_id, output=output, manifest=manifest)
+
+    def event(self, kind, **data):
+        with (self.output / "events.jsonl").open("a") as stream:
             stream.write(
-                json.dumps(
-                    {
-                        "time": datetime.now(timezone.utc).isoformat(),
-                        "kind": kind,
-                        **data,
-                    }
-                )
-                + "\n"
+                json.dumps({"time": datetime.now(timezone.utc).isoformat(), "kind": kind, **data}) + "\n"
             )
 
-    def lifecycle(operation, call):
+    def lifecycle(self, operation, call):
         start = time.monotonic()
-        event("lifecycle_start", operation=operation)
+        self.event("lifecycle_start", operation=operation)
         result = call()
-        event(
-            "lifecycle_end",
-            operation=operation,
-            duration_seconds=time.monotonic() - start,
-        )
+        self.event("lifecycle_end", operation=operation, duration_seconds=time.monotonic() - start)
         return result
 
-    def create(label, **kwargs):
-        vm = lifecycle(
-            "create:" + label,
+    def create_sandbox(self, label, **kwargs):
+        vm = self.lifecycle(
+            f"create:{label}",
             lambda: Sandbox.create(
-                name=f"repro-{run_id}-{label}",
+                name=f"repro-{self.run_id}-{label}",
                 timeout_seconds=300,
                 auto_delete_seconds=3600,
                 **kwargs,
             ),
         )
-        sandboxes.append(vm)
-        manifest["sandboxes"].append({"label": label, "id": vm.id})
+        self.sandboxes.append(vm)
+        self.manifest["sandboxes"].append({"label": label, "id": vm.id})
         return vm
 
-    def capture(vm, label):
-        snap = lifecycle(
-            "snapshot:" + label,
+    def take_snapshot(self, vm, label):
+        snap = self.lifecycle(
+            f"snapshot:{label}",
             lambda: vm.snapshot(
-                name=f"repro-{run_id}-{label}", idempotency_key=f"{run_id}-{label}"
+                name=f"repro-{self.run_id}-{label}", idempotency_key=f"{self.run_id}-{label}"
             ),
         )
-        snapshots.append(snap)
-        manifest["snapshots"].append({"label": label, "id": snap.id})
+        self.snapshots.append(snap)
+        self.manifest["snapshots"].append({"label": label, "id": snap.id})
         return snap
 
-    def command(vm, text):
-        event("action", sandbox_id=vm.id, command=text)
+    def run_command(self, vm, text):
+        self.event("action", sandbox_id=vm.id, command=text)
         result = vm.commands.run(text, timeout_seconds=30)
-        event(
+        self.event(
             "observation",
             sandbox_id=vm.id,
             stdout=result.stdout,
@@ -103,127 +124,126 @@ def main():
         require(result.exit_code == 0, f"Command failed in {vm.id}: {result.stderr}")
         return result.stdout
 
-    def state(vm, step=False):
-        code = (
-            "import urllib.request; print(urllib.request.urlopen("
-            "urllib.request.Request('http://127.0.0.1:8765/"
-            + ("step', method='POST'" if step else "state', method='GET'")
-            + "), timeout=5).read().decode())"
-        )
-        return json.loads(command(vm, "python3 -c " + shlex.quote(code)))
+    def task_state(self, vm):
+        return json.loads(self.run_command(vm, "python3 -c " + shlex.quote(worker_request("state", "GET"))))
 
-    def finish(vm, label):
-        current = state(vm)
+    def step_task(self, vm):
+        return json.loads(self.run_command(vm, "python3 -c " + shlex.quote(worker_request("step", "POST"))))
+
+    def finish_task(self, vm, label):
+        """Drive the task to completion, grade its output, and export the evidence."""
+        current = self.task_state(vm)
         for _ in range(5 - current["index"]):
-            state(vm, step=True)
-        artifact = vm.files.read(ROOT + "/result.json")
-        score = int(json.loads(artifact) == EXPECTED)
-        manifest["scores"][label] = score
-        event(
+            self.step_task(vm)
+        artifact = vm.files.read(TASK_ROOT + "/result.json")
+        score = int(json.loads(artifact) == EXPECTED_RESULT)
+        self.manifest["scores"][label] = score
+        self.event(
             "score",
             sandbox_id=vm.id,
             label=label,
             reward=score,
-            expected=EXPECTED,
+            expected=EXPECTED_RESULT,
             actual=json.loads(artifact),
         )
-        (output / f"{label}-result.json").write_bytes(artifact)
-        (output / f"{label}-files.zip").write_bytes(vm.files.download_dir(ROOT))
+        (self.output / f"{label}-result.json").write_bytes(artifact)
+        (self.output / f"{label}-files.zip").write_bytes(vm.files.download_dir(TASK_ROOT))
         require(score == 1, f"Task failed for {label}")
         return artifact
 
-    try:
-        source = create("source", from_template="superserve/python-3.11")
-        source.files.write(
-            ROOT + "/worker.py", Path(__file__).with_name("worker.py").read_text()
-        )
-        source.files.write(ROOT + "/marker.txt", "starting-state\n")
-        command(
-            source,
-            f"nohup python3 {ROOT}/worker.py >{ROOT}/worker.log 2>&1 </dev/null &",
-        )
-        # Readiness is bounded and uses the actual service, not a fixed delay.
-        ready = "import time, urllib.request\nfor _ in range(50):\n try:\n  urllib.request.urlopen('http://127.0.0.1:8765/state', timeout=1); break\n except OSError: time.sleep(.1)\nelse: raise RuntimeError('worker did not start')"
-        command(source, "python3 -c " + shlex.quote(ready))
-        initial = state(source)
-        require(
-            initial["index"] == 0 and initial["total"] == 0, "Invalid starting state"
-        )
-        baseline = capture(source, "baseline")
-        trial = create("trial", from_snapshot=baseline)
-        require(state(trial) == initial, "Baseline fork lost process memory")
-        state(trial, step=True)
-        midpoint = state(trial, step=True)
-        require(midpoint["index"] == 2 and midpoint["total"] == 34, "Invalid midpoint")
-        trial.files.write(ROOT + "/marker.txt", "midpoint\n")
-        checkpoint = capture(trial, "midpoint")
+    def finalize(self, status, error=None):
+        self.manifest["status"] = status
+        if error is not None:
+            self.manifest["error"] = str(error)
+            self.event("error", message=str(error))
 
-        lifecycle("pause", lambda: trial.pause(wait=True))
-        require(trial.get_info().status.value == "paused", "Pause did not complete")
-        lifecycle("resume", trial.resume)
-        require(state(trial) == midpoint, "Pause/resume lost memory state")
-        require(
-            trial.files.read_text(ROOT + "/marker.txt") == "midpoint\n",
-            "Resume lost disk state",
-        )
-        expected_artifact = finish(trial, "resumed")
-
-        restored = create("checkpoint", from_snapshot=checkpoint)
-        require(state(restored) == midpoint, "Checkpoint restore lost memory state")
-        require(
-            restored.files.read_text(ROOT + "/marker.txt") == "midpoint\n",
-            "Checkpoint lost disk state",
-        )
-        command(restored, f"test ! -e {ROOT}/result.json")
-        require(
-            finish(restored, "checkpoint") == expected_artifact,
-            "Checkpoint result differs",
-        )
-
-        # Reset is a fresh VM from the immutable baseline, not an in-place API.
-        reset = create("reset", from_snapshot=baseline)
-        require(state(reset) == initial, "Reset retained task progress")
-        require(
-            reset.files.read_text(ROOT + "/marker.txt") == "starting-state\n",
-            "Reset retained file edits",
-        )
-        command(reset, f"test ! -e {ROOT}/result.json")
-        require(finish(reset, "reset") == expected_artifact, "Reset result differs")
-        require(state(source) == initial, "Fork changed the source process")
-        require(
-            source.files.read_text(ROOT + "/marker.txt") == "starting-state\n",
-            "Fork changed source files",
-        )
-        manifest["status"] = "passed"
-    except BaseException as error:
-        manifest["status"] = "failed"
-        manifest["error"] = str(error)
-        event("error", message=str(error))
-        raise
-    finally:
         cleanup_errors = []
-        for resource in reversed(sandboxes):
+        for sandbox in reversed(self.sandboxes):
             try:
-                resource.kill()
-                event("deleted_sandbox", id=resource.id)
-            except Exception as error:
-                cleanup_errors.append({"sandbox_id": resource.id, "error": str(error)})
-        for resource in reversed(snapshots):
+                sandbox.kill()
+                self.event("deleted_sandbox", id=sandbox.id)
+            except Exception as exc:
+                cleanup_errors.append({"sandbox_id": sandbox.id, "error": str(exc)})
+        for snapshot in reversed(self.snapshots):
             try:
-                resource.delete()
-                event("deleted_snapshot", id=resource.id)
-            except Exception as error:
-                cleanup_errors.append({"snapshot_id": resource.id, "error": str(error)})
-        manifest["cleanup_errors"] = cleanup_errors
-        manifest["sha256"] = {
+                snapshot.delete()
+                self.event("deleted_snapshot", id=snapshot.id)
+            except Exception as exc:
+                cleanup_errors.append({"snapshot_id": snapshot.id, "error": str(exc)})
+        self.manifest["cleanup_errors"] = cleanup_errors
+
+        self.manifest["sha256"] = {
             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in output.iterdir()
+            for p in self.output.iterdir()
             if p.is_file()
         }
-        (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        print(f"Evidence: {output.resolve()}; status: {manifest['status']}")
+        (self.output / "manifest.json").write_text(json.dumps(self.manifest, indent=2) + "\n")
+        print(f"Evidence: {self.output.resolve()}; status: {self.manifest['status']}")
         if cleanup_errors:
             print("Cleanup incomplete; see resource IDs in manifest.json")
+
+
+def demonstrate_lifecycle(run: Run) -> None:
+    """Exercise reset, checkpoint/resume, and checkpoint-restore against one worker task."""
+    source = run.create_sandbox("source", from_template="superserve/python-3.11")
+    source.files.write(TASK_ROOT + "/worker.py", Path(__file__).with_name("worker.py").read_text())
+    source.files.write(TASK_ROOT + "/marker.txt", "starting-state\n")
+    run.run_command(source, START_WORKER)
+    run.run_command(source, "python3 -c " + shlex.quote(WAIT_FOR_WORKER))
+
+    initial = run.task_state(source)
+    require(initial["index"] == 0 and initial["total"] == 0, "Invalid starting state")
+    baseline = run.take_snapshot(source, "baseline")
+
+    # Checkpoint and pause/resume: continue the same sandbox.
+    trial = run.create_sandbox("trial", from_snapshot=baseline)
+    require(run.task_state(trial) == initial, "Baseline fork lost process memory")
+    run.step_task(trial)
+    midpoint = run.step_task(trial)
+    require(midpoint["index"] == 2 and midpoint["total"] == 34, "Invalid midpoint")
+    trial.files.write(TASK_ROOT + "/marker.txt", "midpoint\n")
+    checkpoint = run.take_snapshot(trial, "midpoint")
+
+    run.lifecycle("pause", lambda: trial.pause(wait=True))
+    require(trial.get_info().status.value == "paused", "Pause did not complete")
+    run.lifecycle("resume", trial.resume)
+    require(run.task_state(trial) == midpoint, "Pause/resume lost memory state")
+    require(trial.files.read_text(TASK_ROOT + "/marker.txt") == "midpoint\n", "Resume lost disk state")
+    expected_artifact = run.finish_task(trial, "resumed")
+
+    # Restore an earlier checkpoint: a new sandbox created from the saved snapshot.
+    restored = run.create_sandbox("checkpoint", from_snapshot=checkpoint)
+    require(run.task_state(restored) == midpoint, "Checkpoint restore lost memory state")
+    require(restored.files.read_text(TASK_ROOT + "/marker.txt") == "midpoint\n", "Checkpoint lost disk state")
+    run.run_command(restored, f"test ! -e {TASK_ROOT}/result.json")
+    require(run.finish_task(restored, "checkpoint") == expected_artifact, "Checkpoint result differs")
+
+    # Reset: a fresh sandbox from the immutable baseline, not an in-place reset() API.
+    reset = run.create_sandbox("reset", from_snapshot=baseline)
+    require(run.task_state(reset) == initial, "Reset retained task progress")
+    require(reset.files.read_text(TASK_ROOT + "/marker.txt") == "starting-state\n", "Reset retained file edits")
+    run.run_command(reset, f"test ! -e {TASK_ROOT}/result.json")
+    require(run.finish_task(reset, "reset") == expected_artifact, "Reset result differs")
+
+    # Isolation: forking never mutated the original source sandbox.
+    require(run.task_state(source) == initial, "Fork changed the source process")
+    require(source.files.read_text(TASK_ROOT + "/marker.txt") == "starting-state\n", "Fork changed source files")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=Path("runs"))
+    args = parser.parse_args()
+    if not os.environ.get("SUPERSERVE_API_KEY"):
+        parser.error("Set SUPERSERVE_API_KEY before running this live example")
+
+    run = Run.start(args.output)
+    try:
+        demonstrate_lifecycle(run)
+        run.finalize("passed")
+    except BaseException as error:
+        run.finalize("failed", error=error)
+        raise
 
 
 if __name__ == "__main__":
