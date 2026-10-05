@@ -151,12 +151,8 @@ class Run:
         require(score == 1, f"Task failed for {label}")
         return artifact
 
-    def finalize(self, status, error=None):
-        self.manifest["status"] = status
-        if error is not None:
-            self.manifest["error"] = str(error)
-            self.event("error", message=str(error))
-
+    def finalize(self):
+        """Clean up sandboxes/snapshots and write the manifest. Always run from a `finally` block."""
         cleanup_errors = []
         for sandbox in reversed(self.sandboxes):
             try:
@@ -240,10 +236,14 @@ def main():
     run = Run.start(args.output)
     try:
         demonstrate_lifecycle(run)
-        run.finalize("passed")
+        run.manifest["status"] = "passed"
     except BaseException as error:
-        run.finalize("failed", error=error)
+        run.manifest["status"] = "failed"
+        run.manifest["error"] = str(error)
+        run.event("error", message=str(error))
         raise
+    finally:
+        run.finalize()
 
 
 if __name__ == "__main__":
