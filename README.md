@@ -29,6 +29,32 @@ python run.py
 Use `python run.py --output /path/to/results` to change the export directory.
 Do not commit credentials or generated run output.
 
+## Follow the intermediate states
+
+The script prints lifecycle operations as they happen, then prints the observed
+memory and disk state at each verification point. For example (IDs shortened):
+
+```text
+[PASS] before checkpoint: step=2 sum=34 memory=abc12345 marker=midpoint result=absent vm=trial-id
+[PASS] after resume (same VM): step=2 sum=34 memory=abc12345 marker=midpoint result=absent vm=trial-id
+[PASS] resumed complete: step=5 sum=171 memory=abc12345 marker=midpoint result=present vm=trial-id
+[PASS] checkpoint restored (new VM): step=2 sum=34 memory=abc12345 marker=midpoint result=absent vm=checkpoint-id
+[PASS] reset baseline (new VM): step=0 sum=0 memory=abc12345 marker=starting-state result=absent vm=reset-id
+```
+
+Read these rows in order: after the trial finishes at step 5, checkpoint restore
+returns to step 2 and removes the later result file. Reset returns to step 0 and
+the original disk marker. Pause/resume keeps the trial's VM ID; restore and reset
+have different VM IDs. The matching memory token shows that the process state
+was restored, rather than the worker being restarted.
+
+All three final result files intentionally contain the same count and sum.
+They demonstrate reproducibility after completing the task; the differences
+between the lifecycle operations are in the intermediate states. Open
+`summary.md` in the export directory for a comparison table, or `states.json`
+for full observed and expected values. Failed comparisons are saved and marked
+`FAIL` before the script exits nonzero.
+
 ## What the example proves
 
 | Operation | Mechanism | Passing check |
@@ -58,6 +84,9 @@ Each invocation writes `runs/<run-id>/`:
   lifecycle operations with measured durations, scores, and cleanup events.
 - `manifest.json`: overall status, SDK version, sandbox and snapshot IDs,
   per-trial rewards, file SHA-256 hashes, and cleanup failures if any.
+- `summary.md`: a readable table of observed intermediate and completed states.
+- `states.json`: each state's stage, VM ID, full memory token, progress, disk
+  marker, result-file presence, expected values, and passing/failing comparison.
 - `{resumed,checkpoint,reset}-result.json`: final task outputs.
 - `{resumed,checkpoint,reset}-files.zip`: exported task directories, including
   the worker source, marker, log, and result.
@@ -98,9 +127,9 @@ python -m unittest discover -s . -p 'test_*.py' -v
 python -m compileall -q run.py worker.py
 ```
 
-Local tests exercise the real worker over HTTP and confirm a restart loses its
-memory-only progress. Only a credentialed `python run.py` can verify the VM
-lifecycle operations.
+Local tests exercise the real worker over HTTP, confirm a restart loses its
+memory-only progress, and check state reporting and failure evidence. Only a
+credentialed `python run.py` can verify the VM lifecycle operations.
 
 ## Run in GitHub Actions
 

@@ -56,6 +56,7 @@ class Run:
     manifest: dict
     sandboxes: list = field(default_factory=list)
     snapshots: list = field(default_factory=list)
+    states: list = field(default_factory=list)
 
     @classmethod
     def start(cls, output_root: Path) -> "Run":
@@ -81,9 +82,12 @@ class Run:
 
     def lifecycle(self, operation, call):
         start = time.monotonic()
+        print(f"Running {operation}...", flush=True)
         self.event("lifecycle_start", operation=operation)
         result = call()
-        self.event("lifecycle_end", operation=operation, duration_seconds=time.monotonic() - start)
+        duration = time.monotonic() - start
+        self.event("lifecycle_end", operation=operation, duration_seconds=duration)
+        print(f"Finished {operation} in {duration:.2f}s", flush=True)
         return result
 
     def create_sandbox(self, label, **kwargs):
@@ -130,6 +134,66 @@ class Run:
     def step_task(self, vm):
         return json.loads(self.run_command(vm, "python3 -c " + shlex.quote(worker_request("step", "POST"))))
 
+    def verify_state(self, vm, stage, expected, marker, result_exists=False):
+        """Show and export the actual intermediate state before checking it."""
+        state = self.task_state(vm)
+        actual_marker = vm.files.read_text(TASK_ROOT + "/marker.txt")
+        code = f"import json, os; print(json.dumps(os.path.exists({TASK_ROOT + '/result.json'!r})))"
+        actual_result_exists = json.loads(
+            self.run_command(vm, "python3 -c " + shlex.quote(code))
+        )
+        passed = (
+            state == expected
+            and actual_marker == marker
+            and actual_result_exists == result_exists
+        )
+        record = {
+            "stage": stage,
+            "sandbox_id": vm.id,
+            "state": state,
+            "marker": actual_marker,
+            "result_exists": actual_result_exists,
+            "expected": {
+                "state": expected,
+                "marker": marker,
+                "result_exists": result_exists,
+            },
+            "passed": passed,
+        }
+        self.states.append(record)
+        (self.output / "states.json").write_text(json.dumps(self.states, indent=2) + "\n")
+        rows = [
+            "# Observed lifecycle states",
+            "",
+            "Each row is measured before checking it. Matching final results are intentional: "
+            "resume and checkpoint restore continue from step 2; reset starts from step 0.",
+            "The memory column abbreviates the in-memory token; states.json contains full tokens "
+            "and the expected values for every check.",
+            "",
+            "| Stage | VM ID | Step | Sum | Memory | Disk marker | Result file | Check |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for item in self.states:
+            memory = item["state"]
+            rows.append(
+                f"| {item['stage']} | {item['sandbox_id']} | {memory['index']} | "
+                f"{memory['total']} | {memory['token'][:8]} | {item['marker'].strip()} | "
+                f"{'present' if item['result_exists'] else 'absent'} | "
+                f"{'PASS' if item['passed'] else 'FAIL'} |"
+            )
+        (self.output / "summary.md").write_text("\n".join(rows) + "\n")
+        self.event("state_check", **record)
+        print(
+            f"[{'PASS' if passed else 'FAIL'}] {stage}: "
+            f"step={state['index']} sum={state['total']} "
+            f"memory={state['token'][:8]} marker={actual_marker.strip()} "
+            f"result={'present' if actual_result_exists else 'absent'} "
+            f"vm={vm.id}",
+            flush=True,
+        )
+        require(passed, f"State check failed at {stage}; see states.json")
+        return state
+
     def finish_task(self, vm, label):
         """Drive the task to completion, grade its output, and export the evidence."""
         current = self.task_state(vm)
@@ -149,6 +213,14 @@ class Run:
         (self.output / f"{label}-result.json").write_bytes(artifact)
         (self.output / f"{label}-files.zip").write_bytes(vm.files.download_dir(TASK_ROOT))
         require(score == 1, f"Task failed for {label}")
+        self.verify_state(
+            vm,
+            f"{label} complete",
+            {"token": current["token"], "index": 5, "total": EXPECTED_RESULT["sum"]},
+            "starting-state\n" if label == "reset" else "midpoint\n",
+            result_exists=True,
+        )
+        print(f"[PASS] {label} reward={score}; result={json.loads(artifact)}", flush=True)
         return artifact
 
     def finalize(self):
@@ -189,41 +261,42 @@ def demonstrate_lifecycle(run: Run) -> None:
 
     initial = run.task_state(source)
     require(initial["index"] == 0 and initial["total"] == 0, "Invalid starting state")
+    run.verify_state(source, "baseline", initial, "starting-state\n")
     baseline = run.take_snapshot(source, "baseline")
 
     # Checkpoint and pause/resume: continue the same sandbox.
     trial = run.create_sandbox("trial", from_snapshot=baseline)
-    require(run.task_state(trial) == initial, "Baseline fork lost process memory")
+    run.verify_state(trial, "baseline fork", initial, "starting-state\n")
     run.step_task(trial)
     midpoint = run.step_task(trial)
     require(midpoint["index"] == 2 and midpoint["total"] == 34, "Invalid midpoint")
     trial.files.write(TASK_ROOT + "/marker.txt", "midpoint\n")
+    run.verify_state(trial, "before checkpoint", midpoint, "midpoint\n")
     checkpoint = run.take_snapshot(trial, "midpoint")
 
     run.lifecycle("pause", lambda: trial.pause(wait=True))
     require(trial.get_info().status.value == "paused", "Pause did not complete")
+    print(f"[PASS] trial is paused; vm={trial.id}", flush=True)
     run.lifecycle("resume", trial.resume)
-    require(run.task_state(trial) == midpoint, "Pause/resume lost memory state")
-    require(trial.files.read_text(TASK_ROOT + "/marker.txt") == "midpoint\n", "Resume lost disk state")
+    run.verify_state(trial, "after resume (same VM)", midpoint, "midpoint\n")
     expected_artifact = run.finish_task(trial, "resumed")
 
     # Restore an earlier checkpoint: a new sandbox created from the saved snapshot.
     restored = run.create_sandbox("checkpoint", from_snapshot=checkpoint)
-    require(run.task_state(restored) == midpoint, "Checkpoint restore lost memory state")
-    require(restored.files.read_text(TASK_ROOT + "/marker.txt") == "midpoint\n", "Checkpoint lost disk state")
-    run.run_command(restored, f"test ! -e {TASK_ROOT}/result.json")
+    require(restored.id != trial.id, "Checkpoint restore reused the trial VM")
+    run.verify_state(restored, "checkpoint restored (new VM)", midpoint, "midpoint\n")
     require(run.finish_task(restored, "checkpoint") == expected_artifact, "Checkpoint result differs")
+    print("[PASS] checkpoint result bytes match resumed result", flush=True)
 
     # Reset: a fresh sandbox from the immutable baseline, not an in-place reset() API.
     reset = run.create_sandbox("reset", from_snapshot=baseline)
-    require(run.task_state(reset) == initial, "Reset retained task progress")
-    require(reset.files.read_text(TASK_ROOT + "/marker.txt") == "starting-state\n", "Reset retained file edits")
-    run.run_command(reset, f"test ! -e {TASK_ROOT}/result.json")
+    require(reset.id not in {source.id, trial.id, restored.id}, "Reset reused an existing VM")
+    run.verify_state(reset, "reset baseline (new VM)", initial, "starting-state\n")
     require(run.finish_task(reset, "reset") == expected_artifact, "Reset result differs")
+    print("[PASS] reset result bytes match resumed result", flush=True)
 
     # Isolation: forking never mutated the original source sandbox.
-    require(run.task_state(source) == initial, "Fork changed the source process")
-    require(source.files.read_text(TASK_ROOT + "/marker.txt") == "starting-state\n", "Fork changed source files")
+    run.verify_state(source, "source unchanged", initial, "starting-state\n")
 
 
 def main():
